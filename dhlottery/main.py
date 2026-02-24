@@ -26,7 +26,7 @@ import uvicorn
 from dh_lottery_client import DhLotteryClient, DhLotteryError, DhLotteryLoginError
 from dh_lotto_645 import DhLotto645, DhLotto645SelMode, DhLotto645Error
 from dh_lotto_analyzer import DhLottoAnalyzer
-from dh_pension_720 import DhPension720, DhPension720Error, DhPension720PurchaseError
+from dh_pension_720 import DhPension720, DhPension720BuyData, DhPension720Error, DhPension720PurchaseError
 from mqtt_discovery import MQTTDiscovery, publish_sensor_mqtt, publish_button_mqtt
 
 logging.basicConfig(
@@ -379,20 +379,16 @@ async def execute_pension_purchase(account: AccountData, button_id: str):
 
         logger.info(f"[PENSION][{username}] Success! Round: {buy_data.round_no}, tickets: {buy_data.ticket_count}")
         _last_purchase_time[key] = time.monotonic()
-
-        await publish_sensor_for_account(account, "pension720_balance", buy_data.deposit, {
-            "friendly_name": "연금복권 잔액", "icon": "mdi:wallet", "unit_of_measurement": "원",
-            "deposit": buy_data.deposit,
-        })
+        await update_sensors_for_account(account)
 
     except DhPension720PurchaseError as e:
         logger.warning(f"[PENSION][{username}] Purchase rejected: {e}")
-        await publish_sensor_for_account(account, "pension720_login_error", str(e)[:255], {
+        await publish_sensor_for_account(account, "pension720_error", str(e)[:255], {
             "error": str(e), "friendly_name": "연금복권 오류", "icon": "mdi:alert-circle",
         })
     except Exception as e:
         logger.error(f"[PENSION][{username}] Failed: {e}", exc_info=True)
-        await publish_sensor_for_account(account, "pension720_login_error", str(e)[:255], {
+        await publish_sensor_for_account(account, "pension720_error", str(e)[:255], {
             "error": str(e), "friendly_name": "연금복권 오류", "icon": "mdi:alert-circle",
         })
 
@@ -656,21 +652,44 @@ async def _update_lotto645_sensors(account: AccountData):
 
 async def _update_pension720_sensors(account: AccountData):
     username = account.username
+
+    # 잔액은 로또와 동일한 www 공통 API 사용 (이미 update_sensors_for_account에서 조회됨)
     try:
-        balance = await account.pension_720.async_get_balance()
+        balance = await account.client.async_get_balance()
         await publish_sensor_for_account(account, "pension720_balance", balance.purchase_available, {
             "friendly_name": "연금복권 구매가능금액", "icon": "mdi:wallet",
-            "unit_of_measurement": "원", "deposit": balance.deposit,
+            "unit_of_measurement": "KRW", "deposit": balance.deposit,
             "purchase_available": balance.purchase_available,
         })
-        await publish_sensor_for_account(account, "pension720_login_error", "", {
+        await publish_sensor_for_account(account, "pension720_error", "", {
             "friendly_name": "연금복권 오류", "icon": "mdi:account-check",
         })
     except Exception as e:
         logger.warning(f"[PENSION][{username}] 잔액 조회 실패: {e}")
-        await publish_sensor_for_account(account, "pension720_login_error", str(e)[:255], {
+        await publish_sensor_for_account(account, "pension720_error", str(e)[:255], {
             "error": str(e), "friendly_name": "연금복권 오류", "icon": "mdi:account-alert",
         })
+
+    # 구매 이력
+    try:
+        history = await account.pension_720.async_get_buy_history()
+        if history:
+            latest = history[0]
+            await publish_sensor_for_account(account, "pension720_latest_purchase", latest.round_no, {
+                "round_no": latest.round_no,
+                "barcode": latest.barcode,
+                "ticket_count": latest.ticket_count,
+                "amount": latest.amount,
+                "result": latest.result,
+                "friendly_name": "연금복권 최근 구매", "icon": "mdi:receipt-text",
+            })
+        round_info = await account.pension_720.async_get_round_info()
+        current_round = round_info.get("round", 0)
+        await publish_sensor_for_account(account, "pension720_round", current_round, {
+            "friendly_name": "연금복권 회차", "icon": "mdi:counter",
+        })
+    except Exception as e:
+        logger.warning(f"[PENSION][{username}] 이력/회차 조회 실패: {e}")
 
 
 # ---------------------------------------------------------------------------
@@ -996,14 +1015,14 @@ async def pension_buy(username: str, count: int):
     try:
         _last_purchase_time[key] = now
         buy_data = await account.pension_720.async_buy_5() if count == 5 else await account.pension_720.async_buy_1()
-        await _update_pension720_sensors(account)
+        await update_sensors_for_account(account)
         return {
             "success": True,
             "round_no": buy_data.round_no,
             "ticket_count": buy_data.ticket_count,
             "tickets": buy_data.tickets,
             "fail_count": buy_data.fail_count,
-            "deposit": buy_data.deposit,
+            "amount": buy_data.amount,
         }
     except DhPension720PurchaseError as e:
         raise HTTPException(status_code=400, detail=str(e))
@@ -1019,14 +1038,13 @@ async def get_balance(username: str):
         raise HTTPException(status_code=404, detail="Account not found")
     try:
         balance = await account.client.async_get_balance()
-        result = {
+        return {
             "deposit": balance.deposit,
             "purchase_available": balance.purchase_available,
+            "reservation_purchase": balance.reservation_purchase,
+            "withdrawal_request": balance.withdrawal_request,
+            "this_month_accumulated": balance.this_month_accumulated_purchase,
         }
-        if account.pension_720:
-            p_balance = await account.pension_720.async_get_balance()
-            result["pension720_purchase_available"] = p_balance.purchase_available
-        return result
     except Exception as e:
         logger.error(f"[API][{username}] 잔액 조회 실패: {e}", exc_info=True)
         raise HTTPException(status_code=500, detail="Failed to get balance")

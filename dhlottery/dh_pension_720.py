@@ -8,9 +8,10 @@ Base URL: https://el.dhlottery.co.kr
 Purchase Flow: makeOrderNo.do → connPro.do → checkDeposit.do
 """
 
-import os
+import datetime
 import logging
 import base64
+import os
 import time
 from dataclasses import dataclass
 from typing import Optional, List
@@ -36,19 +37,12 @@ class DhPension720PurchaseError(DhPension720Error):
 
 
 @dataclass
-class DhPension720BalanceData:
-    deposit: int = 0
-    purchase_available: int = 0
-
-
-@dataclass
 class DhPension720BuyData:
     round_no: int
     ticket_count: int
     tickets: str
     fail_count: int
     fail_tickets: str
-    deposit: int
     amount: int
 
 
@@ -67,13 +61,6 @@ class DhPension720BuyHistoryData:
 # ---------------------------------------------------------------------------
 
 def _encrypt(plaintext: str, jsessionid: str) -> str:
-    """
-    AES-128-CBC encrypt with PBKDF2 key derivation.
-    Returns URL-encoded string matching JavaScript encrypt().
-
-    Format: hex(salt,32B) + hex(iv,16B) + base64(ciphertext)
-    Then URL-encoded (encodeURIComponent).
-    """
     passphrase = jsessionid[:32].encode("utf-8")
     salt = os.urandom(32)
     iv = os.urandom(16)
@@ -93,10 +80,6 @@ def _encrypt(plaintext: str, jsessionid: str) -> str:
 
 
 def _decrypt(enc_text: str, jsessionid: str) -> str:
-    """
-    AES-128-CBC decrypt with PBKDF2 key derivation.
-    Matches JavaScript decrypt().
-    """
     passphrase = jsessionid[:32].encode("utf-8")
 
     salt = bytes.fromhex(enc_text[:64])
@@ -123,218 +106,63 @@ class DhPension720:
     """연금복권 720+ 클라이언트"""
 
     def __init__(self, client):
-        """
-        Args:
-            client: DhLotteryClient 인스턴스 (로그인 완료 상태)
-        """
         self.client = client
         self._jsessionid: Optional[str] = None
 
     # ------------------------------------------------------------------
-    # Session helpers
+    # Session helpers - 로또와 동일한 세션 재사용, JSESSIONID만 확보
     # ------------------------------------------------------------------
 
     async def _ensure_session(self):
-        """el.dhlottery.co.kr 세션(JSESSIONID) 확보
+        """el.dhlottery.co.kr JSESSIONID 확보 (단순화 버전)
 
-        NOTE:
-          - el.dhlottery.co.kr 쪽은 때때로 redirect를 타거나,
-            Set-Cookie가 최초 응답(resp / resp.history)에만 내려오는 경우가 있음.
-          - aiohttp는 resp.cookies 및 cookie_jar 둘 다 활용하는 편이 안전.
+        로또와 동일한 aiohttp 세션을 그대로 사용.
+        el 도메인 방문 한 번으로 JSESSIONID를 받아오고,
+        cookie_jar에 이미 있으면 바로 사용.
         """
         if self._jsessionid:
             return
 
-        async def _pick_jsessionid_from_response(resp) -> Optional[str]:
-            """Try multiple sources:
-            - resp.cookies
-            - resp.history cookies
-            - raw Set-Cookie headers (covers cases where cookie jar doesn't store)
-            """
-            # 1) 현재 응답 쿠키
-            try:
-                if resp.cookies:
-                    # accept any cookie key that starts with JSESSIONID
-                    for k, v in resp.cookies.items():
-                        if k.upper().startswith("JSESSIONID"):
-                            return v.value
-            except Exception:
-                pass
-
-            # 2) redirect 히스토리 쿠키
-            try:
-                for h in (resp.history or []):
-                    if not h.cookies:
-                        continue
-                    for k, v in h.cookies.items():
-                        if k.upper().startswith("JSESSIONID"):
-                            return v.value
-            except Exception:
-                pass
-
-            # 3) raw Set-Cookie headers
-            try:
-                hdrs = []
-                try:
-                    hdrs = resp.headers.getall("Set-Cookie", [])
-                except Exception:
-                    v = resp.headers.get("Set-Cookie")
-                    if v:
-                        hdrs = [v]
-
-                for line in hdrs:
-                    # e.g. "JSESSIONID=....; Path=/; Secure; HttpOnly"
-                    parts = [p.strip() for p in line.split(";") if p.strip()]
-                    if not parts:
-                        continue
-                    kv = parts[0]
-                    if "=" not in kv:
-                        continue
-                    name, val = kv.split("=", 1)
-                    if name.upper().startswith("JSESSIONID") and val:
-                        return val
-            except Exception:
-                pass
-
-            return None
-
-        async def _log_cookiejar(prefix: str = ""):
-            for cookie in self.client.session.cookie_jar:
-                try:
-                    _LOGGER.debug(
-                        f"{prefix}[PENSION720] cookie: {cookie.key}={cookie.value[:16]}... "
-                        f"domain={cookie.get('domain', '?')} path={cookie.get('path','?')}"
-                    )
-                except Exception:
-                    continue
-
-        async def _attempt_fetch_jsessionid(tag: str = ""):
-            # (A) EL 루트 방문
-            try:
-                async with self.client.session.get(
-                    f"{EL_BASE_URL}/",
-                    allow_redirects=True,
-                    headers={
-                        "Origin": EL_BASE_URL,
-                        "Referer": f"{EL_BASE_URL}/",
-                    },
-                ) as resp0:
-                    try:
-                        await resp0.text()
-                    except Exception:
-                        pass
-
-                    _LOGGER.info(
-                        f"[PENSION720]{tag} el root status={resp0.status}, url={resp0.url}"
-                    )
-                    self._jsessionid = await _pick_jsessionid_from_response(resp0)
-            except Exception as e:
-                _LOGGER.warning(f"[PENSION720]{tag} el root visit failed (ignored): {e}")
-
-            # (B) game.jsp 방문 (핵심)
-            if not self._jsessionid:
-                try:
-                    async with self.client.session.get(
-                        f"{EL_BASE_URL}/game/pension720/game.jsp",
-                        allow_redirects=True,
-                        headers={
-                            "Origin": EL_BASE_URL,
-                            "Referer": f"{EL_BASE_URL}/game/pension720/game.jsp",
-                        },
-                    ) as resp:
-                        try:
-                            await resp.text()
-                        except Exception:
-                            pass
-
-                        _LOGGER.info(
-                            f"[PENSION720]{tag} game.jsp status={resp.status}, url={resp.url}"
-                        )
-                        self._jsessionid = await _pick_jsessionid_from_response(resp)
-                except Exception as e:
-                    _LOGGER.warning(f"[PENSION720]{tag} game.jsp visit failed (ignored): {e}")
-
-            # (C) cookie_jar에서 재시도
-            if not self._jsessionid:
-                try:
-                    cookies = self.client.session.cookie_jar.filter_cookies(URL(EL_BASE_URL))
-                    morsel = cookies.get("JSESSIONID")
-                    if morsel:
-                        self._jsessionid = morsel.value
-                except Exception:
-                    pass
-
-            # (D) 전체 cookie_jar 탐색
-            if not self._jsessionid:
-                try:
-                    for cookie in self.client.session.cookie_jar:
-                        if cookie.key.upper().startswith("JSESSIONID"):
-                            self._jsessionid = cookie.value
-                            break
-                except Exception:
-                    pass
-
-        # 1차 시도 (로또45처럼: 먼저 mainMode=N 세션 확보 후 EL 접근)
+        # 1) cookie_jar에 이미 있는지 먼저 확인
         try:
-            await self.client._async_ensure_main_mode_normal()
+            cookies = self.client.session.cookie_jar.filter_cookies(URL(EL_BASE_URL))
+            morsel = cookies.get("JSESSIONID")
+            if morsel and getattr(morsel, "value", None):
+                self._jsessionid = morsel.value
+                _LOGGER.info(f"[PENSION720] cookie_jar에서 JSESSIONID 확보: {self._jsessionid[:8]}...")
+                return
         except Exception:
             pass
-        await _attempt_fetch_jsessionid(tag="")
 
-        # 2차 시도: 로또45 애드온 방식처럼 세션 리셋 + 재로그인(+ mainMode=N) 후 재시도
-        if not self._jsessionid:
-            _LOGGER.warning("[PENSION720] JSESSIONID 1차 획득 실패 → 세션 리셋/재로그인 후 재시도")
-            try:
-                await self.client.async_reset_session_and_login()
-                try:
-                    await self.client._async_ensure_main_mode_normal()
-                except Exception:
-                    pass
-            except Exception as e:
-                _LOGGER.warning(f"[PENSION720] 세션 리셋/재로그인 실패(계속 진행): {e}")
-
-            await _attempt_fetch_jsessionid(tag="[retry]")
-
-        if not self._jsessionid:
-            # fallback 1: 로또(=www)처럼 DHJSESSIONID를 세션키로 사용 시도
-            # (EL이 JSESSIONID를 발급하지 않는 환경에서 우회 가능성)
-            try:
-                cookies_www = self.client.session.cookie_jar.filter_cookies(URL("https://www.dhlottery.co.kr"))
-                dhjs = cookies_www.get("DHJSESSIONID")
-                if dhjs and getattr(dhjs, "value", None):
-                    self._jsessionid = dhjs.value
-                    _LOGGER.warning(
-                        "[PENSION720] EL JSESSIONID 미발급 → DHJSESSIONID를 세션키로 사용합니다."
-                    )
-            except Exception:
-                pass
+        # 2) game.jsp 방문해서 JSESSIONID 받기
+        try:
+            async with self.client.session.get(
+                f"{EL_BASE_URL}/game/pension720/game.jsp",
+                allow_redirects=True,
+            ) as resp:
+                await resp.text()
+                # 응답 쿠키 확인
+                for k, v in resp.cookies.items():
+                    if k.upper().startswith("JSESSIONID"):
+                        self._jsessionid = v.value
+                        break
+                # 없으면 cookie_jar 재확인
+                if not self._jsessionid:
+                    cookies = self.client.session.cookie_jar.filter_cookies(URL(EL_BASE_URL))
+                    morsel = cookies.get("JSESSIONID")
+                    if morsel and getattr(morsel, "value", None):
+                        self._jsessionid = morsel.value
+        except Exception as e:
+            _LOGGER.warning(f"[PENSION720] game.jsp 방문 실패: {e}")
 
         if not self._jsessionid:
-            # fallback 2: el 도메인에서 JSESSIONID 대신 WMONID만 내려오는 케이스가 있음
-            try:
-                cookies_el = self.client.session.cookie_jar.filter_cookies(URL(EL_BASE_URL))
-                wmon = cookies_el.get("WMONID")
-                if wmon and getattr(wmon, "value", None):
-                    self._jsessionid = wmon.value
-                    _LOGGER.warning(
-                        "[PENSION720] JSESSIONID 쿠키가 없어 WMONID를 세션키로 사용합니다. "
-                        "(서버 정책 변경 가능성)"
-                    )
-            except Exception:
-                pass
+            raise DhPension720Error("JSESSIONID를 가져올 수 없습니다. el.dhlottery.co.kr 접근 불가")
 
-        if not self._jsessionid:
-            await _log_cookiejar(prefix="")
-            all_cookies = [
-                f"{c.key}(domain={c.get('domain', '?')},path={c.get('path','?')})"
-                for c in self.client.session.cookie_jar
-            ]
-            _LOGGER.error(
-                f"[PENSION720] JSESSIONID 없음. 전체 쿠키: {all_cookies}"
-            )
-            raise DhPension720Error("JSESSIONID를 가져올 수 없습니다")
+        _LOGGER.info(f"[PENSION720] JSESSIONID 확보: {self._jsessionid[:8]}...")
 
-        _LOGGER.info(f"[PENSION720] JSESSIONID: {self._jsessionid[:8]}...")
+    def _reset_session(self):
+        """세션 리셋 (재시도 시 사용)"""
+        self._jsessionid = None
 
     def _enc(self, form_data: str) -> str:
         return _encrypt(form_data, self._jsessionid)
@@ -349,7 +177,24 @@ class DhPension720:
         return {k: v[0] if len(v) == 1 else v for k, v in params.items()}
 
     # ------------------------------------------------------------------
-    # Plain-JSON info endpoints (암호화 불필요)
+    # 구매 가능 시간 체크 (로또와 동일 방식)
+    # ------------------------------------------------------------------
+
+    @staticmethod
+    def _check_buy_time():
+        """연금복권 구매 가능 시간 확인 (KST 기준)"""
+        now = datetime.datetime.now()
+        if now.hour < 6:
+            raise DhPension720PurchaseError(
+                "[ERROR] 구매 시간이 아닙니다. (06:00~24:00 구매 가능)"
+            )
+        if now.weekday() == 5 and now.hour >= 20:
+            raise DhPension720PurchaseError(
+                "[ERROR] 토요일 20:00 이후 구매 불가. (일요일 06:00부터 가능)"
+            )
+
+    # ------------------------------------------------------------------
+    # Round info
     # ------------------------------------------------------------------
 
     async def async_get_round_info(self) -> dict:
@@ -358,19 +203,6 @@ class DhPension720:
             f"{EL_BASE_URL}/roundRemainTime.do"
         )
         return await resp.json()
-
-    async def async_get_balance(self) -> DhPension720BalanceData:
-        """잔액 조회 (selectCrntEntrsAmt.do)"""
-        await self._ensure_session()
-        t = int(time.time() * 1000)
-        resp = await self.client.session.get(
-            f"{EL_BASE_URL}/selectCrntEntrsAmt.do?_={t}"
-        )
-        result = await resp.json()
-        return DhPension720BalanceData(
-            deposit=result.get("totBuyAmt", 0),
-            purchase_available=result.get("crntEntrsAmt", 0),
-        )
 
     # ------------------------------------------------------------------
     # Purchase
@@ -389,15 +221,27 @@ class DhPension720:
         연금복권 720+ 자동 구매
 
         Flow:
-          0. roundRemainTime.do  → 현재 회차 / 잔여시간
-          1. makeOrderNo.do      → 주문번호 생성 (encrypted)
-          2. connPro.do          → 구매 실행   (encrypted)
-          3. checkDeposit.do     → 잔액 확인   (encrypted)
+          0. 구매 시간 확인 (로또와 동일)
+          1. roundRemainTime.do  → 현재 회차 / 잔여시간
+          2. makeOrderNo.do      → 주문번호 생성 (encrypted)
+          3. connPro.do          → 구매 실행   (encrypted)
+          4. checkDeposit.do     → 잔액 확인   (encrypted)
         """
-        await self._ensure_session()
+        # ── Step 0: 구매 시간 확인 ────────────────────
+        self._check_buy_time()
+
+        # ── 세션 확보 (JSESSIONID) ────────────────────
+        try:
+            await self._ensure_session()
+        except DhPension720Error:
+            # 세션 리셋 후 재시도 1회
+            self._reset_session()
+            await self.client.async_login()
+            await self._ensure_session()
+
         ticket_count = len(groups)
 
-        # ── Step 0: 회차 확인 ─────────────────────────
+        # ── Step 1: 회차 확인 ─────────────────────────
         round_info = await self.async_get_round_info()
         current_round = round_info.get("round", 0)
         if not current_round:
@@ -407,8 +251,7 @@ class DhPension720:
             raise DhPension720PurchaseError("판매 마감되었습니다")
 
         _LOGGER.info(
-            f"[PURCHASE] round={current_round}, remainTime={remain}, "
-            f"groups={groups}"
+            f"[PURCHASE] round={current_round}, remainTime={remain}, groups={groups}"
         )
 
         # ── frmauto 공통 serialize ────────────────────
@@ -422,7 +265,7 @@ class DhPension720:
             ("ACCS_TYPE", "01"),
         ])
 
-        # ── Step 1: makeOrderNo.do ────────────────────
+        # ── Step 2: makeOrderNo.do ────────────────────
         resp1 = await self.client.session.post(
             f"{EL_BASE_URL}/makeOrderNo.do",
             data={"q": self._enc(frmauto)},
@@ -437,7 +280,7 @@ class DhPension720:
             raise DhPension720PurchaseError("주문번호 생성 실패")
         _LOGGER.info(f"[PURCHASE] orderNo={order_no}")
 
-        # ── Step 2: connPro.do ────────────────────────
+        # ── Step 3: connPro.do ────────────────────────
         buy_nos = [f"{g}000000" for g in groups]
         buy_set_types = ["SA"] * ticket_count
 
@@ -495,23 +338,17 @@ class DhPension720:
         fail_ticket = p2.get("failTicket", "")
 
         _LOGGER.info(
-            f"[PURCHASE] resultCode={result_code}, "
-            f"saleCnt={sale_cnt}, failCnt={fail_cnt}"
+            f"[PURCHASE] resultCode={result_code}, saleCnt={sale_cnt}, failCnt={fail_cnt}"
         )
 
         if result_code == "120":
             raise DhPension720PurchaseError(f"구매 전체 실패: {fail_ticket}")
         if result_code not in ("100", "110"):
-            raise DhPension720PurchaseError(
-                f"구매 실패 (code={result_code})"
-            )
+            raise DhPension720PurchaseError(f"구매 실패 (code={result_code})")
         if result_code == "110":
-            _LOGGER.warning(
-                f"[PURCHASE] 일부 실패: {fail_cnt}건 - {fail_ticket}"
-            )
+            _LOGGER.warning(f"[PURCHASE] 일부 실패: {fail_cnt}건 - {fail_ticket}")
 
-        # ── Step 3: checkDeposit.do ───────────────────
-        deposit = 0
+        # ── Step 4: checkDeposit.do ───────────────────
         try:
             resp3 = await self.client.session.post(
                 f"{EL_BASE_URL}/checkDeposit.do",
@@ -519,8 +356,7 @@ class DhPension720:
             )
             r3 = await resp3.json()
             if "q" in r3:
-                p3 = self._parse(self._dec(r3["q"]))
-                deposit = int(p3.get("deposit", "0"))
+                self._parse(self._dec(r3["q"]))
         except Exception as e:
             _LOGGER.warning(f"[PURCHASE] checkDeposit 오류 (무시): {e}")
 
@@ -530,26 +366,25 @@ class DhPension720:
             tickets=sale_ticket,
             fail_count=fail_cnt,
             fail_tickets=fail_ticket,
-            deposit=deposit,
             amount=sale_cnt * 1000,
         )
 
     # ------------------------------------------------------------------
-    # History (www.dhlottery.co.kr 경유)
+    # History (www.dhlottery.co.kr 경유 - 로또와 동일한 API)
     # ------------------------------------------------------------------
 
     async def async_get_buy_history(self) -> List[DhPension720BuyHistoryData]:
-        """구매 이력 조회"""
+        """구매 이력 조회 (www.dhlottery.co.kr - 로또와 동일 엔드포인트)"""
         try:
             items = await self.client.async_get_buy_list("P720")
             return [
                 DhPension720BuyHistoryData(
-                    round_no=item.get("round", 0),
-                    issue_dt=item.get("issueDt", ""),
-                    barcode=item.get("barcode", ""),
-                    ticket_count=item.get("ticketCount", 0),
-                    amount=item.get("amount", 0),
-                    result=item.get("result", "미추첨"),
+                    round_no=item.get("ltEpsd", 0),
+                    issue_dt=item.get("issueDay", ""),
+                    barcode=item.get("gmInfo", ""),
+                    ticket_count=item.get("prchsQty", 0),
+                    amount=item.get("ntslAmt", 0),
+                    result=item.get("ltWnResult", "미추첨"),
                 )
                 for item in items
             ]

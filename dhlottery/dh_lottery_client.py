@@ -192,32 +192,41 @@ class DhLotteryClient:
                 for i, redirect_resp in enumerate(resp.history):
                     _LOGGER.debug(f"  {i+1}. {redirect_resp.status} -> {redirect_resp.url}")
             
-            # 성공 조건: 200 OK고 URL loginSuccess.do 포함
-            if resp.status == 200 and 'loginSuccess.do' in final_url:
+            # 성공 조건: 200 OK이고 로그인된 영역으로 이동한 경우
+            # - loginSuccess.do: 기존 성공 리다이렉트
+            # - /mypage/: 마지막 시도 URL로 돌아가기 방식 (세션 만료 후 재로그인 시)
+            # - /main: 메인 페이지 리다이렉트
+            LOGIN_SUCCESS_INDICATORS = ['loginSuccess.do', '/mypage/', '/main']
+            # 실패 조건: 로그인 페이지 자체로 돌아온 경우
+            LOGIN_FAILURE_INDICATORS = ['/login/loginCheck', '/login/loginFailed', '/login/loginError']
+            is_success = resp.status == 200 and any(p in final_url for p in LOGIN_SUCCESS_INDICATORS)
+            is_failure = any(p in final_url for p in LOGIN_FAILURE_INDICATORS)
+
+            if is_success and not is_failure:
                 self.logged_in = True
-                _LOGGER.info("Login successful!")
+                _LOGGER.info(f"Login successful! (URL: {final_url})")
                 # 로또45 애드온처럼 정상 페이지(mainMode=N) 세션을 한 번 확보
                 try:
                     await self._async_ensure_main_mode_normal()
                 except Exception as e:
                     _LOGGER.debug(f"Ensure mainMode=N skipped/failed: {e}")
                 return
-            
+
             # failed 처리
             _LOGGER.error(f"Login failed - Status: {resp.status}, URL: {final_url}")
             self.logged_in = False
-            
+
             # 응답 내용 확인 (디버깅용)
             try:
                 response_text = await resp.text()
-                if "failed" in response_text or "" in response_text:
-                    _LOGGER.error(f"    : {response_text[:200]}")
+                if response_text:
+                    _LOGGER.error(f"응답 내용: {response_text[:200]}")
             except:
                 pass
-            
+
             raise DhLotteryLoginError(
-                "Login failed.   number . "
-                "(5 failed  .   page number  )"
+                "로그인 실패. 아이디/비밀번호를 확인하세요. "
+                "(5회 실패 시 계정이 잠길 수 있습니다.)"
             )
             
         except DhLotteryError:
@@ -286,105 +295,6 @@ class DhLotteryClient:
                 raise DhLotteryError("RSA key not found in login page.")
         except Exception as ex:
             raise DhLotteryError(f"RSA key fetch failed: {ex}") from ex
-
-    async def async_get_balance(self) -> DhLotteryBalanceData:
-        """Balance status query합니다."""
-        try:
-            current_time = int(datetime.datetime.now().timestamp() * 1000)
-            user_result = await self.async_get_with_login(
-                "mypage/selectUserMndp.do", 
-                params={"_": current_time}
-            )
-
-            user_mndp = user_result.get("userMndp", {})
-            pnt_dpst_amt = user_mndp.get("pntDpstAmt", 0)
-            pnt_tkmny_amt = user_mndp.get("pntTkmnyAmt", 0)
-            ncsbl_dpst_Amt = user_mndp.get("ncsblDpstAmt", 0)
-            ncsbl_tkmny_amt = user_mndp.get("ncsblTkmnyAmt", 0)
-            csbl_dpst_amt = user_mndp.get("csblDpstAmt", 0)
-            csbl_tkmny_amt = user_mndp.get("csblTkmnyAmt", 0)
-            total_amt = (pnt_dpst_amt - pnt_tkmny_amt) + (ncsbl_dpst_Amt - ncsbl_tkmny_amt) + (csbl_dpst_amt - csbl_tkmny_amt)
-
-            crnt_entrs_amt = user_mndp.get("crntEntrsAmt", 0)
-            rsvt_ordr_amt = user_mndp.get("rsvtOrdrAmt", 0)
-            daw_aply_amt = user_mndp.get("dawAplyAmt", 0)
-            fee_amt = user_mndp.get("feeAmt", 0)
-
-            purchase_impossible = rsvt_ordr_amt + daw_aply_amt + fee_amt
-
-            home_result = await self.async_get_with_login(
-                "mypage/selectMyHomeInfo.do",
-                params={"_": current_time},
-            )
-            prchs_lmt_info = home_result.get("prchsLmtInfo", {})
-            wly_prchs_acml_amt = prchs_lmt_info.get("wlyPrchsAcmlAmt", 0)
-            
-            return DhLotteryBalanceData(
-                deposit=total_amt,
-                purchase_available=crnt_entrs_amt,
-                reservation_purchase=rsvt_ordr_amt,
-                withdrawal_request=daw_aply_amt,
-                purchase_impossible=purchase_impossible,
-                this_month_accumulated_purchase=wly_prchs_acml_amt,
-            )
-        except Exception as ex:
-            raise DhLotteryError(f"[ERROR] Balance status query failed: {ex}") from ex
-
-    async def async_get_buy_list(self, lotto_id: str) -> list[dict[str, Any]]:
-        """1주일간 purchasehistory query합니다."""
-        end_date = datetime.datetime.now()
-        start_date = end_date - datetime.timedelta(days=7)
-        try:
-            result = await self.async_get_with_login(
-                "mypage/selectMyLotteryledger.do",
-                params={
-                    "srchStrDt": start_date.strftime("%Y%m%d"),
-                    "srchEndDt": end_date.strftime("%Y%m%d"),
-                    "ltGdsCd": lotto_id,
-                    "pageNum": 1,
-                    "recordCountPerPage": 1000,
-                    "_": int(datetime.datetime.now().timestamp() * 1000)
-                },
-            )
-            return result.get("list", [])
-        except Exception as ex:
-            raise DhLotteryError(
-                f"[ERROR] recent 1 purchasehistory query failed: {ex}"
-            ) from ex
-
-    async def async_get_accumulated_prize(self, lotto_id: str) -> int:
-        """payment deadline ended되지 not winning금 accumulated amount query합니다. 기간 1년"""
-        end_date = datetime.datetime.now()
-        start_date = end_date - datetime.timedelta(days=365)
-        try:
-            result = await self.async_get_with_login(
-                "mypage/selectMyLotteryledger.do",
-                params={
-                    "srchStrDt": start_date.strftime("%Y%m%d"),
-                    "srchEndDt": end_date.strftime("%Y%m%d"),
-                    "ltGdsCd": lotto_id,
-                    "pageNum": 1,
-                    "winResult": "T",
-                    "recordCountPerPage": 1000,
-                    "_": int(datetime.datetime.now().timestamp() * 1000),
-                },
-            )
-            items = result.get("list", [])
-
-            accum_prize: int = 0
-            for item in items:
-                accum_prize += item.get("ltWnAmt", 0)
-            return accum_prize
-
-        except Exception as ex:
-            raise DhLotteryError(
-                f"[ERROR] payment deadline ended not winning query : {ex}"
-            ) from ex
-
-    def __del__(self):
-        """소멸자"""
-        if self.session and not self.session.closed:
-            _LOGGER.warning("Session was not properly closed")
 
     async def async_get_balance(self) -> DhLotteryBalanceData:
         """Balance status query합니다."""
