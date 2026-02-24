@@ -1,6 +1,6 @@
 {
   "name": "동행복권 통합",
-  "version": "1.0.1",
+  "version": "1.0.2",
   "slug": "dhlottery",
   "description": "로또 6/45 + 연금복권 720+ 통합 Add-on with MQTT Discovery",
   "url": "https://github.com/darkhowk/ha-dhlottery",

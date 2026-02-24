@@ -199,10 +199,17 @@ class DhPension720:
 
     async def async_get_round_info(self) -> dict:
         """현재 회차 정보 조회 (roundRemainTime.do)"""
+        await self._ensure_session()
         resp = await self.client.session.get(
             f"{EL_BASE_URL}/roundRemainTime.do"
         )
-        return await resp.json()
+        try:
+            return await resp.json(content_type=None)
+        except Exception as e:
+            text = await resp.text()
+            raise DhPension720Error(
+                f"roundRemainTime.do 응답 파싱 실패 (HTML 반환 의심): {text[:300]}"
+            ) from e
 
     # ------------------------------------------------------------------
     # Purchase
