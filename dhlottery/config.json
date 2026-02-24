@@ -1,8 +1,8 @@
 {
-  "name": "연금복권 720+ (DH Lottery Pension 720+)",
-  "version": "1.0.8",
-  "slug": "dhyeongeum720",
-  "description": "DH Lottery Pension 720+ Add-on with MQTT Discovery - Multi-Account Support",
+  "name": "동행복권 통합",
+  "version": "1.0.0",
+  "slug": "dhlottery",
+  "description": "로또 6/45 + 연금복권 720+ 통합 Add-on with MQTT Discovery",
   "url": "https://github.com/darkhowk/ha-dhlottery",
   "arch": ["amd64", "armv7", "aarch64"],
   "build_from": {
@@ -21,6 +21,7 @@
         "enabled": true
       }
     ],
+    "enable_lotto645": true,
     "enable_pension720": true,
     "update_interval": 3600,
     "use_mqtt": true,
@@ -36,6 +37,7 @@
         "enabled": "bool?"
       }
     ],
+    "enable_lotto645": "bool",
     "enable_pension720": "bool",
     "update_interval": "int(60,86400)?",
     "use_mqtt": "bool?",
@@ -56,8 +58,8 @@
   "ingress": true,
   "ingress_port": 60100,
   "ingress_stream": false,
-  "panel_icon": "mdi:receipt",
-  "panel_title": "연금복권 720+",
+  "panel_icon": "mdi:ticket-confirmation",
+  "panel_title": "동행복권 통합",
   "host_network": false,
   "privileged": [],
   "full_access": false,
