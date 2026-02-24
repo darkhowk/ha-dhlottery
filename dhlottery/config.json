@@ -3,7 +3,7 @@
   "version": "1.0.8",
   "slug": "dhyeongeum720",
   "description": "DH Lottery Pension 720+ Add-on with MQTT Discovery - Multi-Account Support",
-  "url": "https://github.com/darkhowk/ha-addons-dh720",
+  "url": "https://github.com/darkhowk/ha-dhlottery",
   "arch": ["amd64", "armv7", "aarch64"],
   "build_from": {
     "amd64": "ghcr.io/home-assistant/amd64-base:latest",
