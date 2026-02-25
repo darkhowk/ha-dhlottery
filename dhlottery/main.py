@@ -26,7 +26,7 @@ import uvicorn
 from dh_lottery_client import DhLotteryClient, DhLotteryError, DhLotteryLoginError
 from dh_lotto_645 import DhLotto645, DhLotto645SelMode, DhLotto645Error
 from dh_lotto_analyzer import DhLottoAnalyzer
-from dh_pension_720 import DhPension720, DhPension720BuyData, DhPension720Error, DhPension720PurchaseError
+from dh_pension_720 import DhPension720, DhPension720BuyData, DhPension720Error, DhPension720PurchaseError, PensionTicket
 from mqtt_discovery import MQTTDiscovery, publish_sensor_mqtt, publish_button_mqtt
 
 logging.basicConfig(
@@ -47,6 +47,7 @@ class AccountData:
         self.analyzer: Optional[DhLottoAnalyzer] = None
         self.pension_720: Optional[DhPension720] = None
         self.manual_numbers_state = "auto,auto,auto,auto,auto,auto"
+        self.pension_manual_state = "1,000000"   # 조,번호 형식 (예: "1,123456" / "all,123456")
         self.update_task: Optional[asyncio.Task] = None
 
 
@@ -197,8 +198,10 @@ async def register_buttons_for_account(account: AccountData):
     # 연금복권 720+ 버튼
     if config["enable_pension720"] and account.pension_720:
         for button_id, button_name, icon in [
-            ("pension_buy_1", "연금복권 1장 구매", "mdi:receipt"),
-            ("pension_buy_5", "연금복권 5장 구매", "mdi:receipt-text"),
+            ("pension_buy_1",        "연금복권 1장 자동구매",       "mdi:receipt"),
+            ("pension_buy_5",        "연금복권 5장 자동구매(전조)", "mdi:receipt-text"),
+            ("pension_buy_same_all", "연금복권 동일번호 5조 구매",  "mdi:numeric"),
+            ("pension_buy_manual",   "연금복권 수동구매",           "mdi:hand-pointing-right"),
         ]:
             topic = f"homeassistant/button/{mqtt_client.topic_prefix}_{username}_{button_id}/command"
             mqtt_client.publish_button_discovery(
@@ -206,6 +209,18 @@ async def register_buttons_for_account(account: AccountData):
                 username=username, device_name=device_name,
                 device_identifier=device_id, icon=icon,
             )
+
+        # 연금복권 수동번호 입력 텍스트 (형식: "조,번호" 예: "1,123456" / "all,123456")
+        pension_input_state = f"homeassistant/text/{mqtt_client.topic_prefix}_{username}_pension_manual/state"
+        pension_input_cmd = f"homeassistant/text/{mqtt_client.topic_prefix}_{username}_pension_manual/set"
+        mqtt_client.publish_input_text_discovery(
+            input_id="pension_manual",
+            name="연금복권 수동 번호 (조,번호 / all,번호)",
+            state_topic=pension_input_state, command_topic=pension_input_cmd,
+            username=username, device_name=device_name,
+            device_identifier=device_id, icon="mdi:numeric", mode="text",
+        )
+        mqtt_client.client.publish(pension_input_state, account.pension_manual_state, qos=1, retain=True)
 
     logger.info(f"[BUTTON][{username}] All buttons registered")
 
@@ -243,10 +258,16 @@ def on_button_command(client_mqtt, userdata, message):
 
         # Input text 처리
         if "/text/" in topic and "/set" in topic:
-            account.manual_numbers_state = payload
-            state_topic = f"homeassistant/text/{mqtt_client.topic_prefix}_{username}_manual_numbers/state"
-            client_mqtt.publish(state_topic, payload, qos=1, retain=True)
-            logger.info(f"[INPUT][{username}] Manual numbers updated: {payload}")
+            if "pension_manual" in topic:
+                account.pension_manual_state = payload
+                state_topic = f"homeassistant/text/{mqtt_client.topic_prefix}_{username}_pension_manual/state"
+                client_mqtt.publish(state_topic, payload, qos=1, retain=True)
+                logger.info(f"[INPUT][{username}] Pension manual updated: {payload}")
+            else:
+                account.manual_numbers_state = payload
+                state_topic = f"homeassistant/text/{mqtt_client.topic_prefix}_{username}_manual_numbers/state"
+                client_mqtt.publish(state_topic, payload, qos=1, retain=True)
+                logger.info(f"[INPUT][{username}] Manual numbers updated: {payload}")
             return
 
         button_suffix = without_prefix[len(username) + 1:]
@@ -358,6 +379,40 @@ async def execute_lotto_purchase(account: AccountData, button_id: str):
         })
 
 
+def _parse_pension_manual(text: str) -> List[PensionTicket]:
+    """연금복권 수동 입력 파싱.
+
+    형식: "조,번호" (예: "1,123456") 또는 "all,번호" (1~5조 전부 동일번호)
+    번호는 0~999999 사이 정수 또는 6자리 문자열.
+    """
+    parts = [p.strip() for p in text.split(",")]
+    if len(parts) != 2:
+        raise DhPension720PurchaseError(
+            f"입력 형식 오류: '{text}' (올바른 형식: '조,번호' 예: '1,123456' 또는 'all,123456')"
+        )
+
+    group_str, number_str = parts[0].lower(), parts[1]
+
+    try:
+        number = int(number_str)
+    except ValueError:
+        raise DhPension720PurchaseError(f"번호 형식 오류: '{number_str}' (0~999999 정수)")
+    if not (0 <= number <= 999999):
+        raise DhPension720PurchaseError(f"번호 범위 오류: {number} (0~999999)")
+
+    if group_str == "all":
+        return [PensionTicket(group=g, number=number) for g in range(1, 6)]
+
+    try:
+        group = int(group_str)
+    except ValueError:
+        raise DhPension720PurchaseError(f"조 형식 오류: '{group_str}' (1~5 또는 'all')")
+    if not (1 <= group <= 5):
+        raise DhPension720PurchaseError(f"조 범위 오류: {group} (1~5)")
+
+    return [PensionTicket(group=group, number=number)]
+
+
 async def execute_pension_purchase(account: AccountData, button_id: str):
     username = account.username
 
@@ -374,6 +429,11 @@ async def execute_pension_purchase(account: AccountData, button_id: str):
     try:
         if button_id == "pension_buy_5":
             buy_data = await account.pension_720.async_buy_5()
+        elif button_id == "pension_buy_same_all":
+            buy_data = await account.pension_720.async_buy_random_all_groups()
+        elif button_id == "pension_buy_manual":
+            tickets = _parse_pension_manual(account.pension_manual_state)
+            buy_data = await account.pension_720.async_buy_manual(tickets)
         else:
             buy_data = await account.pension_720.async_buy_1()
 
@@ -784,7 +844,7 @@ async def init_clients():
                 username = account.username
 
                 lotto_buttons = ["lotto_buy_auto_1", "lotto_buy_auto_5", "lotto_buy_manual", "lotto_generate_random"]
-                pension_buttons = ["pension_buy_1", "pension_buy_5"]
+                pension_buttons = ["pension_buy_1", "pension_buy_5", "pension_buy_same_all", "pension_buy_manual"]
 
                 for btn in lotto_buttons:
                     topic = f"homeassistant/button/{mqtt_client.topic_prefix}_{username}_{btn}/command"
@@ -796,6 +856,9 @@ async def init_clients():
 
                 input_topic = f"homeassistant/text/{mqtt_client.topic_prefix}_{username}_manual_numbers/set"
                 mqtt_client.client.subscribe(input_topic)
+
+                pension_input_topic = f"homeassistant/text/{mqtt_client.topic_prefix}_{username}_pension_manual/set"
+                mqtt_client.client.subscribe(pension_input_topic)
 
             logger.info("MQTT 구독 완료")
         else:

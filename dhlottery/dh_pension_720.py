@@ -12,6 +12,7 @@ import datetime
 import logging
 import base64
 import os
+import random
 import time
 from dataclasses import dataclass
 from typing import Optional, List
@@ -44,6 +45,27 @@ class DhPension720BuyData:
     fail_count: int
     fail_tickets: str
     amount: int
+
+
+@dataclass
+class PensionTicket:
+    """연금복권 720+ 구매 티켓 (조 + 번호)"""
+    group: int              # 조 (1~5)
+    number: Optional[int] = None  # 6자리 번호 (0~999999), None = 자동(서버 선택)
+
+    @property
+    def is_auto(self) -> bool:
+        return self.number is None
+
+    def buy_no(self) -> str:
+        """BUY_NO 형식: {조}{번호:06d}"""
+        if self.number is None:
+            return f"{self.group}000000"
+        return f"{self.group}{self.number:06d}"
+
+    def set_type(self) -> str:
+        """BUY_SET_TYPE: SA=자동, SE=수동"""
+        return "SA" if self.number is None else "SE"
 
 
 @dataclass
@@ -238,18 +260,39 @@ class DhPension720:
 
     async def async_buy_1(self) -> DhPension720BuyData:
         """1조 자동 1장 구매"""
-        return await self._async_buy(groups=[1])
+        return await self._async_buy([PensionTicket(group=1)])
 
     async def async_buy_5(self) -> DhPension720BuyData:
-        """모든 조 자동 5장 구매"""
-        return await self._async_buy(groups=[1, 2, 3, 4, 5])
+        """1~5조 자동 5장 구매 (조별 다른 번호, 서버 선택)"""
+        return await self._async_buy([PensionTicket(group=g) for g in range(1, 6)])
 
-    async def _async_buy(self, groups: List[int]) -> DhPension720BuyData:
+    async def async_buy_random_all_groups(self) -> DhPension720BuyData:
+        """랜덤 번호 1개를 뽑아 1~5조 전부 동일 번호로 구매"""
+        number = random.randint(0, 999999)
+        _LOGGER.info(f"[PURCHASE] 동일번호 5조 구매 - 번호: {number:06d}")
+        return await self._async_buy([PensionTicket(group=g, number=number) for g in range(1, 6)])
+
+    async def async_buy_manual(self, tickets: List[PensionTicket]) -> DhPension720BuyData:
+        """수동 구매: 조와 번호를 직접 지정
+
+        Args:
+            tickets: PensionTicket 리스트 (group=1~5, number=0~999999)
         """
-        연금복권 720+ 자동 구매
+        if not tickets:
+            raise DhPension720PurchaseError("구매할 티켓이 없습니다")
+        for t in tickets:
+            if not (1 <= t.group <= 5):
+                raise DhPension720PurchaseError(f"조 번호 범위 오류: {t.group} (1~5)")
+            if t.number is not None and not (0 <= t.number <= 999999):
+                raise DhPension720PurchaseError(f"번호 범위 오류: {t.number} (0~999999)")
+        return await self._async_buy(tickets)
+
+    async def _async_buy(self, tickets: List[PensionTicket]) -> DhPension720BuyData:
+        """
+        연금복권 720+ 구매 (자동/수동 통합)
 
         Flow:
-          0. 구매 시간 확인 (로또와 동일)
+          0. 구매 시간 확인
           1. roundRemainTime.do  → 현재 회차 / 잔여시간
           2. makeOrderNo.do      → 주문번호 생성 (encrypted)
           3. connPro.do          → 구매 실행   (encrypted)
@@ -258,16 +301,17 @@ class DhPension720:
         # ── Step 0: 구매 시간 확인 ────────────────────
         self._check_buy_time()
 
-        # ── 세션 확보 (JSESSIONID) ────────────────────
+        # ── 세션 확보 (DHJSESSIONID) ─────────────────
         try:
             await self._ensure_session()
         except DhPension720Error:
-            # 세션 리셋 후 재시도 1회
             self._reset_session()
             await self.client.async_login()
             await self._ensure_session()
 
-        ticket_count = len(groups)
+        ticket_count = len(tickets)
+        is_manual = any(not t.is_auto for t in tickets)
+        buy_type = "S" if is_manual else "A"
 
         # ── Step 1: 회차 확인 ─────────────────────────
         round_info = await self.async_get_round_info()
@@ -275,24 +319,26 @@ class DhPension720:
         if not current_round:
             raise DhPension720PurchaseError("회차 정보를 가져올 수 없습니다")
         remain = round_info.get("remainTime")
-        # remainTime이 None이면 el. 세션 없이 이력 fallback된 것 → 구매 불가
         if remain is None:
             raise DhPension720PurchaseError("판매 잔여시간 확인 불가 (el.dhlottery.co.kr 세션 필요)")
         if remain <= 0:
             raise DhPension720PurchaseError("판매 마감되었습니다")
 
         _LOGGER.info(
-            f"[PURCHASE] round={current_round}, remainTime={remain}, groups={groups}"
+            f"[PURCHASE] round={current_round}, remainTime={remain}, "
+            f"tickets={[t.buy_no() for t in tickets]}, manual={is_manual}"
         )
 
-        # ── frmauto 공통 serialize ────────────────────
+        # ── frmauto: makeOrderNo.do용 파라미터 ────────
+        # 수동: 대표 번호/조 전달 (단일이면 그대로, 다중이면 첫 번째)
+        first_manual = next((t for t in tickets if not t.is_auto), None)
         frmauto = urlencode([
             ("ROUND", current_round),
-            ("SEL_NO", ""),
+            ("SEL_NO", f"{first_manual.number:06d}" if first_manual else ""),
             ("BUY_CNT", ""),
             ("AUTO_SEL_SET", ""),
-            ("SEL_CLASS", ""),
-            ("BUY_TYPE", "A"),
+            ("SEL_CLASS", str(first_manual.group) if first_manual and len(tickets) == 1 else ""),
+            ("BUY_TYPE", buy_type),
             ("ACCS_TYPE", "01"),
         ])
 
@@ -301,7 +347,7 @@ class DhPension720:
             f"{EL_BASE_URL}/makeOrderNo.do",
             data={"q": self._enc(frmauto)},
         )
-        r1 = await resp1.json()
+        r1 = await resp1.json(content_type=None)
         if "q" not in r1:
             raise DhPension720PurchaseError(f"makeOrderNo 응답 오류: {r1}")
 
@@ -312,8 +358,15 @@ class DhPension720:
         _LOGGER.info(f"[PURCHASE] orderNo={order_no}")
 
         # ── Step 3: connPro.do ────────────────────────
-        buy_nos = [f"{g}000000" for g in groups]
-        buy_set_types = ["SA"] * ticket_count
+        buy_nos = [t.buy_no() for t in tickets]
+        buy_set_types = [t.set_type() for t in tickets]
+
+        # 수동일 때 단일 필드 (마지막 수동 티켓 기준)
+        last_manual = next((t for t in reversed(tickets) if not t.is_auto), None)
+        set_type_val = "SE" if last_manual else "SA"
+        classnum_val = str(last_manual.group) if last_manual else ""
+        selnum_val = f"{last_manual.number:06d}" if last_manual else ""
+        num_digits = list(f"{last_manual.number:06d}") if last_manual else [""] * 6
 
         frm = urlencode([
             ("ROUND", current_round),
@@ -322,7 +375,7 @@ class DhPension720:
             ("BUY_NO", ",".join(buy_nos)),
             ("BUY_CNT", ticket_count),
             ("BUY_SET_TYPE", ",".join(buy_set_types)),
-            ("BUY_TYPE", "A"),
+            ("BUY_TYPE", buy_type),
             ("ACCS_TYPE", "01"),
             ("orderNo", order_no),
             ("orderDate", p1.get("orderDate", "")),
@@ -336,16 +389,16 @@ class DhPension720:
             ("WORKING_FLAG", "false"),
             ("NUM_CHANGE_TYPE", ""),
             ("auto_process", ""),
-            ("set_type", "SA"),
-            ("classnum", ""),
-            ("selnum", ""),
-            ("buytype", "A"),
-            ("num1", ""),
-            ("num2", ""),
-            ("num3", ""),
-            ("num4", ""),
-            ("num5", ""),
-            ("num6", ""),
+            ("set_type", set_type_val),
+            ("classnum", classnum_val),
+            ("selnum", selnum_val),
+            ("buytype", buy_type),
+            ("num1", num_digits[0]),
+            ("num2", num_digits[1]),
+            ("num3", num_digits[2]),
+            ("num4", num_digits[3]),
+            ("num5", num_digits[4]),
+            ("num6", num_digits[5]),
             ("DSEC", "0"),
             ("CLOSE_DATE", ""),
             ("verifyYN", "N"),
@@ -357,7 +410,7 @@ class DhPension720:
             f"{EL_BASE_URL}/connPro.do",
             data={"q": self._enc(frm)},
         )
-        r2 = await resp2.json()
+        r2 = await resp2.json(content_type=None)
         if "q" not in r2:
             raise DhPension720PurchaseError(f"connPro 응답 오류: {r2}")
 
