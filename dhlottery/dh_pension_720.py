@@ -114,51 +114,55 @@ class DhPension720:
     # ------------------------------------------------------------------
 
     async def _ensure_session(self):
-        """el.dhlottery.co.kr JSESSIONID 확보 (단순화 버전)
+        """el.dhlottery.co.kr DHJSESSIONID 확보
 
         로또와 동일한 aiohttp 세션을 그대로 사용.
-        el 도메인 방문 한 번으로 JSESSIONID를 받아오고,
-        cookie_jar에 이미 있으면 바로 사용.
+        game.jsp 방문으로 DHJSESSIONID 쿠키를 받아온다.
+        이미 확보된 경우 재사용.
         """
         if self._jsessionid:
             return
 
-        # 1) cookie_jar에 이미 있는지 먼저 확인
+        # 1) cookie_jar에 이미 있는지 먼저 확인 (실제 쿠키명은 DHJSESSIONID)
         try:
             cookies = self.client.session.cookie_jar.filter_cookies(URL(EL_BASE_URL))
-            morsel = cookies.get("JSESSIONID")
-            if morsel and getattr(morsel, "value", None):
-                self._jsessionid = morsel.value
-                _LOGGER.info(f"[PENSION720] cookie_jar에서 JSESSIONID 확보: {self._jsessionid[:8]}...")
-                return
+            for name in ("DHJSESSIONID", "JSESSIONID"):
+                morsel = cookies.get(name)
+                if morsel and getattr(morsel, "value", None):
+                    self._jsessionid = morsel.value
+                    _LOGGER.info(f"[PENSION720] cookie_jar에서 {name} 확보: {self._jsessionid[:8]}...")
+                    return
         except Exception:
             pass
 
-        # 2) game.jsp 방문해서 JSESSIONID 받기
+        # 2) game.jsp 방문해서 DHJSESSIONID 받기
         try:
             async with self.client.session.get(
                 f"{EL_BASE_URL}/game/pension720/game.jsp",
                 allow_redirects=True,
             ) as resp:
                 await resp.text()
-                # 응답 쿠키 확인
+                # 응답 쿠키에서 DHJSESSIONID 또는 JSESSIONID 확인
                 for k, v in resp.cookies.items():
-                    if k.upper().startswith("JSESSIONID"):
+                    if k.upper() in ("DHJSESSIONID", "JSESSIONID"):
                         self._jsessionid = v.value
+                        _LOGGER.info(f"[PENSION720] 응답 쿠키에서 {k} 확보")
                         break
                 # 없으면 cookie_jar 재확인
                 if not self._jsessionid:
                     cookies = self.client.session.cookie_jar.filter_cookies(URL(EL_BASE_URL))
-                    morsel = cookies.get("JSESSIONID")
-                    if morsel and getattr(morsel, "value", None):
-                        self._jsessionid = morsel.value
+                    for name in ("DHJSESSIONID", "JSESSIONID"):
+                        morsel = cookies.get(name)
+                        if morsel and getattr(morsel, "value", None):
+                            self._jsessionid = morsel.value
+                            break
         except Exception as e:
             _LOGGER.warning(f"[PENSION720] game.jsp 방문 실패: {e}")
 
         if not self._jsessionid:
-            raise DhPension720Error("JSESSIONID를 가져올 수 없습니다. el.dhlottery.co.kr 접근 불가")
+            raise DhPension720Error("DHJSESSIONID를 가져올 수 없습니다. el.dhlottery.co.kr 접근 불가")
 
-        _LOGGER.info(f"[PENSION720] JSESSIONID 확보: {self._jsessionid[:8]}...")
+        _LOGGER.info(f"[PENSION720] DHJSESSIONID 확보: {self._jsessionid[:8]}...")
 
     def _reset_session(self):
         """세션 리셋 (재시도 시 사용)"""
@@ -198,18 +202,35 @@ class DhPension720:
     # ------------------------------------------------------------------
 
     async def async_get_round_info(self) -> dict:
-        """현재 회차 정보 조회 (roundRemainTime.do)"""
-        await self._ensure_session()
-        resp = await self.client.session.get(
-            f"{EL_BASE_URL}/roundRemainTime.do"
-        )
+        """현재 회차 정보 조회.
+
+        1차: el.dhlottery.co.kr/roundRemainTime.do (DHJSESSIONID 필요)
+        실패 시 2차: www.dhlottery.co.kr 구매이력(P720)에서 최근 회차 추출
+        """
+        # 1차 시도: el.dhlottery.co.kr
         try:
-            return await resp.json(content_type=None)
+            await self._ensure_session()
+            resp = await self.client.session.get(
+                f"{EL_BASE_URL}/roundRemainTime.do"
+            )
+            data = await resp.json(content_type=None)
+            if isinstance(data, dict) and data.get("round"):
+                return data
+            _LOGGER.warning(f"[PENSION720] roundRemainTime.do 응답 이상: {str(data)[:100]}")
         except Exception as e:
-            text = await resp.text()
-            raise DhPension720Error(
-                f"roundRemainTime.do 응답 파싱 실패 (HTML 반환 의심): {text[:300]}"
-            ) from e
+            _LOGGER.warning(f"[PENSION720] el. 회차 조회 실패, www 이력으로 fallback: {e}")
+
+        # 2차 fallback: www 구매이력에서 최근 회차 추출
+        try:
+            items = await self.client.async_get_buy_list("P720")
+            if items:
+                latest_round = items[0].get("ltEpsd", 0)
+                _LOGGER.info(f"[PENSION720] 구매이력 기반 회차: {latest_round}")
+                return {"round": latest_round, "remainTime": None}
+        except Exception as e:
+            _LOGGER.warning(f"[PENSION720] 구매이력 회차 조회도 실패: {e}")
+
+        return {"round": 0, "remainTime": None}
 
     # ------------------------------------------------------------------
     # Purchase
@@ -253,7 +274,10 @@ class DhPension720:
         current_round = round_info.get("round", 0)
         if not current_round:
             raise DhPension720PurchaseError("회차 정보를 가져올 수 없습니다")
-        remain = round_info.get("remainTime", 0)
+        remain = round_info.get("remainTime")
+        # remainTime이 None이면 el. 세션 없이 이력 fallback된 것 → 구매 불가
+        if remain is None:
+            raise DhPension720PurchaseError("판매 잔여시간 확인 불가 (el.dhlottery.co.kr 세션 필요)")
         if remain <= 0:
             raise DhPension720PurchaseError("판매 마감되었습니다")
 
